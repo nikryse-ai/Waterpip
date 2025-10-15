@@ -16,6 +16,7 @@ from telegram.ext import (
     CallbackQueryHandler,
     ContextTypes,
     MessageHandler,
+    JobQueue,          # <— вручную создаём и запускаем
     filters,
 )
 
@@ -28,8 +29,8 @@ logging.basicConfig(
 log = logging.getLogger("water-bot")
 
 # ------------------ ГЛОБАЛЬНЫЕ ССЫЛКИ ------------------
-APP: Optional[Application] = None  # установим в main()
-JQ = None                          # глобальная ссылка на JobQueue (установим в main())
+APP: Optional[Application] = None   # установим в main()
+JQ: Optional[JobQueue] = None       # установим в main()
 
 # ------------------ KEEPALIVE WEB (для Render Web Service) ------------------
 app_web = Flask(__name__)
@@ -87,18 +88,6 @@ def k_interval(cid): return f"user:{cid}:interval"
 def k_times(cid):    return f"user:{cid}:times"   # CSV "HH:MM,HH:MM"
 def k_ack(cid, stamp): return f"ack:{cid}:{stamp}"
 
-# ------------------ ХЕЛПЕР ДЛЯ JobQueue ------------------
-def get_jq(context: ContextTypes.DEFAULT_TYPE):
-    """Надёжно получить JobQueue из контекста, приложения или глобалки."""
-    jq = getattr(context, "job_queue", None)
-    if jq is None and getattr(context, "application", None):
-        jq = getattr(context.application, "job_queue", None)
-    if jq is None and APP is not None:
-        jq = getattr(APP, "job_queue", None)
-    if jq is None and JQ is not None:
-        jq = JQ
-    return jq
-
 # ------------------ УТИЛИТЫ ------------------
 def parse_times_csv(csv_text: str) -> List[time]:
     items = [x.strip() for x in csv_text.split(",") if x.strip()]
@@ -146,9 +135,8 @@ async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("Я попила 💧", callback_data=f"ack:{stamp}")]])
         await context.bot.send_message(chat_id, text, reply_markup=kb)
 
-        jq = get_jq(context)
-        if jq:
-            jq.run_once(
+        if JQ:
+            JQ.run_once(
                 retry_if_not_ack,
                 when=RETRY_MINUTES * 60,
                 chat_id=chat_id,
@@ -175,25 +163,20 @@ async def retry_if_not_ack(context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         log.exception(f"retry_if_not_ack failed: {e}")
 
-async def schedule_today(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+async def schedule_today(chat_id: int):
     """Расписывает слоты на сегодня и ставит перепланировку на «полночь» МСК."""
     try:
         if not is_enabled(chat_id):
             return
 
-        jq = get_jq(context)
-        if jq is None:
-            # мягкий ретрай — на случай гонки инициализации
-            await asyncio.sleep(2)
-            jq = get_jq(context)
-            if jq is None:
-                log.error("JobQueue not ready after retry; skip schedule_today")
-                return
+        if JQ is None:
+            log.error("Global JobQueue is None; skip schedule_today")
+            return
 
         times = user_times(chat_id)
 
         # удалить старые daily-задачи
-        for job in jq.get_jobs_by_name(f"daily:{chat_id}"):
+        for job in JQ.get_jobs_by_name(f"daily:{chat_id}"):
             job.remove()
 
         now_local = now_msk()
@@ -206,7 +189,7 @@ async def schedule_today(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
             if dt_local >= now_local:
                 stamp = dt_local.isoformat()
                 kv_del(k_ack(chat_id, stamp))
-                jq.run_once(
+                JQ.run_once(
                     send_reminder,
                     when=max(0, (dt_local - now_local).total_seconds()),
                     chat_id=chat_id,
@@ -217,7 +200,7 @@ async def schedule_today(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
 
         # перепланировка на «полночь»
         midnight_next = datetime.combine(today, time(23, 59, 59)) + timedelta(seconds=1)
-        jq.run_once(
+        JQ.run_once(
             midnight_reschedule,
             when=max(1, int((midnight_next - now_local).total_seconds())),
             chat_id=chat_id,
@@ -231,7 +214,7 @@ async def schedule_today(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
 async def midnight_reschedule(context: ContextTypes.DEFAULT_TYPE):
     chat_id = context.job.chat_id
     log.info(f"Midnight reschedule for chat {chat_id}")
-    await schedule_today(context, chat_id)
+    await schedule_today(chat_id)
 
 # ------------------ КОМАНДЫ ------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -239,7 +222,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kv_set(k_enabled(chat_id), "1")
     if not kv_get(k_interval(chat_id)) and not kv_get(k_times(chat_id)):
         kv_set(k_interval(chat_id), str(DEFAULT_INTERVAL_MIN))
-    await schedule_today(context, chat_id)
+    await schedule_today(chat_id)
     await update.message.reply_text(
         "Привет бусинка. Создал тебе бота который напоминает пить воду 💧 каждые 1,5 часа с 07:30 до 00:00.\n\n"
             "Есть команды для удобства:\n"
@@ -251,9 +234,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     kv_set(k_enabled(chat_id), "0")
-    jq = get_jq(context)
-    if jq:
-        for job in jq.jobs():
+    if JQ:
+        for job in JQ.jobs():
             if job.name and f":{chat_id}" in job.name:
                 job.remove()
     await update.message.reply_text("Напоминания отключены. Я рядом, если что ❤️")
@@ -273,7 +255,7 @@ async def set_interval(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kv_set(k_interval(chat_id), str(minutes))
     kv_del(k_times(chat_id))
     kv_set(k_enabled(chat_id), "1")
-    await schedule_today(context, chat_id)
+    await schedule_today(chat_id)
     await update.message.reply_text(f"Интервал изменён на {minutes} мин. (по Москве)")
 
 async def set_times(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -290,7 +272,7 @@ async def set_times(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kv_set(k_times(chat_id), csv)
     kv_del(k_interval(chat_id))
     kv_set(k_enabled(chat_id), "1")
-    await schedule_today(context, chat_id)
+    await schedule_today(chat_id)
     await update.message.reply_text(f"Заданы точные времена: {csv} (по Москве)")
 
 # ------------------ КНОПКИ ------------------
@@ -339,10 +321,16 @@ async def main():
         sys.exit(1)
 
     try:
+        # 1) создаём приложение
         app: Application = ApplicationBuilder().token(token).build()
-        APP = app               # сохраняем ссылку на приложение
-        JQ = app.job_queue      # и на JobQueue (напрямую)
+        APP = app
 
+        # 2) создаём и запускаем собственный JobQueue
+        JQ = JobQueue()
+        JQ.set_application(app)     # привязываем к приложению
+        await JQ.start()            # явно запускаем JobQueue
+
+        # 3) регистрируем хендлеры
         app.add_handler(CommandHandler("start", start))
         app.add_handler(CommandHandler("stop", stop))
         app.add_handler(CommandHandler("interval", set_interval))
@@ -351,6 +339,7 @@ async def main():
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
         app.add_error_handler(on_error)
 
+        # 4) стартуем бота (long polling)
         await app.initialize()
         await app.start()
         log.info("Telegram bot started (long polling)")
@@ -361,6 +350,8 @@ async def main():
         finally:
             await app.updater.stop()
             await app.stop()
+            if JQ:
+                await JQ.stop()
             await app.shutdown()
     except Exception as e:
         log.exception(f"Bot crashed during startup: {e}")
