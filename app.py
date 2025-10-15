@@ -27,8 +27,9 @@ logging.basicConfig(
 )
 log = logging.getLogger("water-bot")
 
-# ------------------ ГЛОБАЛЬНАЯ ССЫЛКА НА ПРИЛОЖЕНИЕ ------------------
-APP: Optional[Application] = None  # будет установлена в main()
+# ------------------ ГЛОБАЛЬНЫЕ ССЫЛКИ ------------------
+APP: Optional[Application] = None  # установим в main()
+JQ = None                          # глобальная ссылка на JobQueue (установим в main())
 
 # ------------------ KEEPALIVE WEB (для Render Web Service) ------------------
 app_web = Flask(__name__)
@@ -86,14 +87,16 @@ def k_interval(cid): return f"user:{cid}:interval"
 def k_times(cid):    return f"user:{cid}:times"   # CSV "HH:MM,HH:MM"
 def k_ack(cid, stamp): return f"ack:{cid}:{stamp}"
 
-# ------------------ ХЕЛПЕР ДЛЯ JOBQUEUE ------------------
+# ------------------ ХЕЛПЕР ДЛЯ JobQueue ------------------
 def get_jq(context: ContextTypes.DEFAULT_TYPE):
-    """Надёжно получить JobQueue из разных мест."""
+    """Надёжно получить JobQueue из контекста, приложения или глобалки."""
     jq = getattr(context, "job_queue", None)
     if jq is None and getattr(context, "application", None):
         jq = getattr(context.application, "job_queue", None)
     if jq is None and APP is not None:
         jq = getattr(APP, "job_queue", None)
+    if jq is None and JQ is not None:
+        jq = JQ
     return jq
 
 # ------------------ УТИЛИТЫ ------------------
@@ -180,8 +183,12 @@ async def schedule_today(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
 
         jq = get_jq(context)
         if jq is None:
-            log.error("JobQueue not ready; skip schedule_today")
-            return
+            # мягкий ретрай — на случай гонки инициализации
+            await asyncio.sleep(2)
+            jq = get_jq(context)
+            if jq is None:
+                log.error("JobQueue not ready after retry; skip schedule_today")
+                return
 
         times = user_times(chat_id)
 
@@ -325,7 +332,7 @@ async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ------------------ MAIN ------------------
 async def main():
-    global APP
+    global APP, JQ
     token = os.getenv("BOT_TOKEN")
     if not token:
         log.error("BOT_TOKEN missing in environment.")
@@ -333,7 +340,8 @@ async def main():
 
     try:
         app: Application = ApplicationBuilder().token(token).build()
-        APP = app  # важно для get_jq()
+        APP = app               # сохраняем ссылку на приложение
+        JQ = app.job_queue      # и на JobQueue (напрямую)
 
         app.add_handler(CommandHandler("start", start))
         app.add_handler(CommandHandler("stop", stop))
