@@ -4,7 +4,7 @@ import asyncio
 import random
 import threading
 import logging
-from datetime import datetime, time, timedelta
+from datetime import datetime, time, timedelta, date
 from typing import Dict, List, Optional
 
 from flask import Flask
@@ -16,7 +16,7 @@ from telegram.ext import (
     CallbackQueryHandler,
     ContextTypes,
     MessageHandler,
-    JobQueue,
+    JobQueue,          # используем свой JobQueue
     filters,
 )
 
@@ -29,8 +29,8 @@ logging.basicConfig(
 log = logging.getLogger("water-bot")
 
 # ------------------ ГЛОБАЛЬНЫЕ ССЫЛКИ ------------------
-APP: Optional[Application] = None
-JQ: Optional[JobQueue] = None
+APP: Optional[Application] = None     # установим в main()
+JQ: Optional[JobQueue] = None         # установим в main()
 
 # ------------------ KEEPALIVE WEB (для Render Web Service) ------------------
 app_web = Flask(__name__)
@@ -73,7 +73,7 @@ def kv_del(key: str):
     else:
         _store.pop(key, None)
 
-# ------------------ КОНСТАНТЫ ------------------
+# ------------------ КОНСТАНТЫ И КЛЮЧИ ------------------
 def now_msk() -> datetime:
     """Текущее московское время без внешних библиотек (UTC+3)."""
     return datetime.utcnow() + timedelta(hours=3)
@@ -120,11 +120,58 @@ def user_times(chat_id: int) -> List[time]:
 def is_enabled(chat_id: int) -> bool:
     return kv_get(k_enabled(chat_id)) == "1"
 
+# ------------------ ОЧИСТКА ДЖОБОВ ------------------
+def clear_jobs_for_chat(chat_id: int, *, remove_daily: bool = True):
+    """Удаляет все задачи данного чата: remind, retry и (опционально) daily."""
+    if JQ is None:
+        return
+    prefixes = [f"remind:{chat_id}:", f"retry:{chat_id}:"]
+    if remove_daily:
+        prefixes.append(f"daily:{chat_id}")
+    for job in list(JQ.jobs()):
+        name = getattr(job, "name", "") or ""
+        if any(name.startswith(p) for p in prefixes):
+            try:
+                job.remove()
+            except Exception:
+                continue
+
+# ------------------ ПОСТАНОВКА СЛОТОВ НА ДЕНЬ ------------------
+async def schedule_day(chat_id: int, target_date: date, *, start_from: Optional[datetime] = None) -> int:
+    """
+    Ставит напоминания на конкретный день target_date.
+    Если start_from указан — ставим только времена >= start_from.
+    Возвращает количество поставленных задач.
+    """
+    if JQ is None:
+        log.error("Global JobQueue is None; skip schedule_day")
+        return 0
+
+    times = user_times(chat_id)
+    now_local = now_msk()
+    count = 0
+    for t in times:
+        dt = datetime.combine(target_date, t)
+        if start_from is not None and dt < start_from:
+            continue
+        if dt >= now_local:
+            stamp = dt.isoformat()
+            kv_del(k_ack(chat_id, stamp))
+            JQ.run_once(
+                send_reminder,
+                when=max(0, (dt - now_local).total_seconds()),
+                chat_id=chat_id,
+                name=f"remind:{chat_id}:{stamp}",
+                data={"stamp": stamp},
+            )
+            count += 1
+    return count
+
 # ------------------ НАПОМИНАНИЯ ------------------
 async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
     try:
         chat_id = context.job.chat_id
-        stamp = (context.job.data or {}).get("stamp")  # <— данные из JobQueue
+        stamp = (context.job.data or {}).get("stamp")
         main_msgs = [
             "Солнышко ☀️, попей водички",
             "Настюша 💖, пора попить водички. Люблю)",
@@ -135,13 +182,14 @@ async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("Я попила 💧", callback_data=f"ack:{stamp}")]])
         await context.bot.send_message(chat_id, text, reply_markup=kb)
 
+        # повтор через 10 минут
         if JQ:
             JQ.run_once(
                 retry_if_not_ack,
                 when=RETRY_MINUTES * 60,
                 chat_id=chat_id,
                 name=f"retry:{chat_id}:{stamp}",
-                data={"stamp": stamp},  # <— передаём через data
+                data={"stamp": stamp},
             )
     except Exception as e:
         log.exception(f"send_reminder failed: {e}")
@@ -163,42 +211,31 @@ async def retry_if_not_ack(context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         log.exception(f"retry_if_not_ack failed: {e}")
 
+# ------------------ ГЛАВНЫЙ ПЛАНИРОВЩИК ------------------
 async def schedule_today(chat_id: int):
-    """Расписывает слоты на сегодня и ставит перепланировку на «полночь» МСК."""
+    """
+    Планирует остаток на сегодня + весь завтрашний день. Ставит полуночный рескейджул.
+    """
     try:
         if not is_enabled(chat_id):
             return
-
         if JQ is None:
             log.error("Global JobQueue is None; skip schedule_today")
             return
 
-        times = user_times(chat_id)
-
-        # удалить старые daily-задачи
-        for job in JQ.get_jobs_by_name(f"daily:{chat_id}"):
-            job.remove()
+        # Полная очистка перед новым планом
+        clear_jobs_for_chat(chat_id, remove_daily=True)
 
         now_local = now_msk()
         today = now_local.date()
-        count = 0
+        tomorrow = today + timedelta(days=1)
 
-        # создать слоты на сегодня
-        for t in times:
-            dt_local = datetime.combine(today, t)
-            if dt_local >= now_local:
-                stamp = dt_local.isoformat()
-                kv_del(k_ack(chat_id, stamp))
-                JQ.run_once(
-                    send_reminder,
-                    when=max(0, (dt_local - now_local).total_seconds()),
-                    chat_id=chat_id,
-                    name=f"remind:{chat_id}:{stamp}",
-                    data={"stamp": stamp},  # <— передаём через data
-                )
-                count += 1
+        # 1) Остаток сегодняшнего дня (начиная с текущего момента)
+        c_today = await schedule_day(chat_id, today, start_from=now_local)
+        # 2) Весь завтрашний день (включая утренние)
+        c_tomorrow = await schedule_day(chat_id, tomorrow, start_from=None)
 
-        # перепланировка на «полночь»
+        # 3) Полуночный рескейджул
         midnight_next = datetime.combine(today, time(23, 59, 59)) + timedelta(seconds=1)
         JQ.run_once(
             midnight_reschedule,
@@ -207,13 +244,15 @@ async def schedule_today(chat_id: int):
             name=f"daily:{chat_id}",
         )
 
-        log.info(f"Scheduled {count} reminders for chat {chat_id}")
+        log.info(f"Scheduled {c_today} (today) + {c_tomorrow} (tomorrow) reminders for chat {chat_id}")
     except Exception as e:
         log.exception(f"schedule_today failed for chat {chat_id}: {e}")
 
 async def midnight_reschedule(context: ContextTypes.DEFAULT_TYPE):
     chat_id = context.job.chat_id
     log.info(f"Midnight reschedule for chat {chat_id}")
+    # Чистим и планируем заново «сегодня + завтра»
+    clear_jobs_for_chat(chat_id, remove_daily=True)
     await schedule_today(chat_id)
 
 # ------------------ КОМАНДЫ ------------------
@@ -222,6 +261,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kv_set(k_enabled(chat_id), "1")
     if not kv_get(k_interval(chat_id)) and not kv_get(k_times(chat_id)):
         kv_set(k_interval(chat_id), str(DEFAULT_INTERVAL_MIN))
+    clear_jobs_for_chat(chat_id, remove_daily=True)
     await schedule_today(chat_id)
     await update.message.reply_text(
         "Привет бусинка. Создал тебе бота который напоминает пить воду 💧 каждые 1,5 часа с 07:30 до 00:00.\n\n"
@@ -234,10 +274,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     kv_set(k_enabled(chat_id), "0")
-    if JQ:
-        for job in JQ.jobs():
-            if job.name and f":{chat_id}" in job.name:
-                job.remove()
+    clear_jobs_for_chat(chat_id, remove_daily=True)
     await update.message.reply_text("Напоминания отключены. Я рядом, если что ❤️")
 
 async def set_interval(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -255,6 +292,7 @@ async def set_interval(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kv_set(k_interval(chat_id), str(minutes))
     kv_del(k_times(chat_id))
     kv_set(k_enabled(chat_id), "1")
+    clear_jobs_for_chat(chat_id, remove_daily=True)
     await schedule_today(chat_id)
     await update.message.reply_text(f"Интервал изменён на {minutes} мин. (по Москве)")
 
@@ -272,6 +310,7 @@ async def set_times(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kv_set(k_times(chat_id), csv)
     kv_del(k_interval(chat_id))
     kv_set(k_enabled(chat_id), "1")
+    clear_jobs_for_chat(chat_id, remove_daily=True)
     await schedule_today(chat_id)
     await update.message.reply_text(f"Заданы точные времена: {csv} (по Москве)")
 
@@ -296,7 +335,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             await context.bot.send_message(chat_id, text)
 
-# ------------------ ОБРАБОТКА ОШИБОК ------------------
+# ------------------ ОБРАБОТКА ОШИБОК И ДИАГНОСТИКА ------------------
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     log.exception("Unhandled exception", exc_info=context.error)
     try:
@@ -308,7 +347,6 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
-# ------------------ ЭХО ДЛЯ ДИАГНОСТИКИ ------------------
 async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Я на связи 💧 Напиши /start")
 
