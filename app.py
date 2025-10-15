@@ -1,8 +1,11 @@
 import os
 import asyncio
 import random
+import threading
 from datetime import datetime, time, timedelta
 from typing import Dict, List, Optional
+
+from flask import Flask  # маленький веб-сервер для Render Web Service
 
 from telegram import (
     Update,
@@ -17,6 +20,16 @@ from telegram.ext import (
     CallbackQueryHandler,
     ContextTypes,
 )
+
+# ----------------- ЛЁГКИЙ ВЕБ-СЕРВЕР (для Render Web Service) -----------------
+app_web = Flask(__name__)
+
+@app_web.route("/")
+def home():
+    return "💧 Water Reminder Bot is running."
+
+def run_web():
+    app_web.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
 
 # ----------------- ХРАНИЛИЩЕ (Redis или in-memory) -----------------
 USE_REDIS = bool(os.getenv("REDIS_URL"))
@@ -287,4 +300,7 @@ async def main():
         await app.shutdown()
 
 if __name__ == "__main__":
+    # Запускаем лёгкий веб-сервер в отдельном потоке,
+    # чтобы Render Web Service видел открытый порт.
+    threading.Thread(target=run_web, daemon=True).start()
     asyncio.run(main())
