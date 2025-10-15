@@ -319,7 +319,6 @@ async def main():
         app: Application = (
             ApplicationBuilder()
             .token(bot_token)
-            .rate_limiter(AIORateLimiter())
             .build()
         )
 
