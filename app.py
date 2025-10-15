@@ -16,7 +16,7 @@ from telegram.ext import (
     CallbackQueryHandler,
     ContextTypes,
     MessageHandler,
-    JobQueue,          # <— вручную создаём и запускаем
+    JobQueue,
     filters,
 )
 
@@ -29,8 +29,8 @@ logging.basicConfig(
 log = logging.getLogger("water-bot")
 
 # ------------------ ГЛОБАЛЬНЫЕ ССЫЛКИ ------------------
-APP: Optional[Application] = None   # установим в main()
-JQ: Optional[JobQueue] = None       # установим в main()
+APP: Optional[Application] = None
+JQ: Optional[JobQueue] = None
 
 # ------------------ KEEPALIVE WEB (для Render Web Service) ------------------
 app_web = Flask(__name__)
@@ -124,7 +124,7 @@ def is_enabled(chat_id: int) -> bool:
 async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
     try:
         chat_id = context.job.chat_id
-        stamp = context.job.kwargs["stamp"]
+        stamp = (context.job.data or {}).get("stamp")  # <— данные из JobQueue
         main_msgs = [
             "Солнышко ☀️, попей водички",
             "Настюша 💖, пора попить водички. Люблю)",
@@ -141,7 +141,7 @@ async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
                 when=RETRY_MINUTES * 60,
                 chat_id=chat_id,
                 name=f"retry:{chat_id}:{stamp}",
-                kwargs={"stamp": stamp},
+                data={"stamp": stamp},  # <— передаём через data
             )
     except Exception as e:
         log.exception(f"send_reminder failed: {e}")
@@ -149,8 +149,8 @@ async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
 async def retry_if_not_ack(context: ContextTypes.DEFAULT_TYPE):
     try:
         chat_id = context.job.chat_id
-        stamp = context.job.kwargs["stamp"]
-        if kv_get(k_ack(chat_id, stamp)) == "1":
+        stamp = (context.job.data or {}).get("stamp")
+        if stamp and kv_get(k_ack(chat_id, stamp)) == "1":
             return
         retry_msgs = [
             "Настюша, ты забыла про воду? 💧",
@@ -194,7 +194,7 @@ async def schedule_today(chat_id: int):
                     when=max(0, (dt_local - now_local).total_seconds()),
                     chat_id=chat_id,
                     name=f"remind:{chat_id}:{stamp}",
-                    kwargs={"stamp": stamp},
+                    data={"stamp": stamp},  # <— передаём через data
                 )
                 count += 1
 
@@ -325,10 +325,10 @@ async def main():
         app: Application = ApplicationBuilder().token(token).build()
         APP = app
 
-        # 2) создаём и запускаем собственный JobQueue
+        # 2) создаём и запускаем собственный JobQueue (требует extra: job-queue)
         JQ = JobQueue()
-        JQ.set_application(app)     # привязываем к приложению
-        await JQ.start()            # явно запускаем JobQueue
+        JQ.set_application(app)
+        await JQ.start()
 
         # 3) регистрируем хендлеры
         app.add_handler(CommandHandler("start", start))
